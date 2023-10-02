@@ -7,9 +7,33 @@ package mr
 //
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 )
+
+type TaskType string
+
+const (
+	Mapper  TaskType = "Mapper"
+	Reducer TaskType = "Reducer"
+	None    TaskType = "None"
+)
+
+type TaskRequest struct {
+}
+
+type TaskResponse struct {
+	File            string
+	Task            TaskType
+	NumberOfReducer int
+	TaskId          int
+	ReducerIndex    int
+}
+
+func (t TaskResponse) String() string {
+	return fmt.Sprintf("[%s, %s]", t.File, t.Task)
+}
 
 // ExampleArgs to show how to declare the arguments
 // for an RPC.
