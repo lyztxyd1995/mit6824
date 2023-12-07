@@ -54,11 +54,9 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
-	term                int32
-	leaderId            int32
-	electionTimeOutFlag int32
-	votedFor            map[int]int
-	step                int32
+	term     int32
+	votedFor map[int]int
+	state    int32 // 0: Leader 1: follower 2: Candidate
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -72,12 +70,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = int(atomic.LoadInt32(&rf.term))
-	leaderId := int(atomic.LoadInt32(&rf.leaderId))
-	isleader = leaderId == rf.me
-
-	if isleader {
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " is leader for term " + strconv.Itoa(term))
-	}
+	state := atomic.LoadInt32(&rf.state)
+	isleader = state == 0
 
 	return term, isleader
 }
@@ -145,31 +139,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	fmt.Println(args)
 
 	term := int(atomic.LoadInt32(&rf.term))
-	leaderId := int(atomic.LoadInt32(&rf.leaderId))
 	// Reject vote if term is less or equal with the current term
-	if term >= args.Term {
+	if term > args.Term {
 		reply.VoteGranted = false
 		reply.Term = term
-		reply.VotedFor = leaderId
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " term is large than the given term")
 		return
 	}
 
 	rf.mu.Lock()
 	votedForId, exists := rf.votedFor[args.Term]
+	rf.mu.Unlock()
 	if !exists || votedForId == args.CandidateId {
-		rf.votedFor[args.Term] = args.CandidateId
-		rf.mu.Unlock()
 		reply.VoteGranted = true
 		reply.Term = args.Term
-		reply.VotedFor = args.CandidateId
 		fmt.Println("Id: " + strconv.Itoa(rf.me) + " grant the vote")
 	} else {
-		rf.mu.Unlock()
 		reply.VoteGranted = false
 		reply.Term = args.Term
-		reply.VotedFor = votedForId
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " deny the vote")
+		fmt.Println("Id: " + strconv.Itoa(rf.me) + " deny the vote with voted for " + strconv.Itoa(int(votedForId)))
 	}
 }
 
@@ -191,12 +178,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	term := int(atomic.LoadInt32(&rf.term))
 	if term < args.Term {
 		atomic.StoreInt32(&rf.term, int32(args.Term))
-		atomic.StoreInt32(&rf.leaderId, int32(args.LeaderId))
-		atomic.StoreInt32(&rf.electionTimeOutFlag, 0)
-		atomic.StoreInt32(&rf.step, 1)
+		atomic.StoreInt32(&rf.state, 1)
 		fmt.Println(strconv.Itoa(rf.me) + " update term to: " + strconv.Itoa(args.Term))
 	} else if term == args.Term {
-		atomic.StoreInt32(&rf.electionTimeOutFlag, 0)
+		atomic.StoreInt32(&rf.state, 1)
 	} else {
 		fmt.Println(strconv.Itoa(rf.me) + " receive heartbeat from legacy leader with term: " + strconv.Itoa(args.Term))
 	}
@@ -285,14 +270,15 @@ func (rf *Raft) killed() bool {
 }
 
 func sendAppendEntiresTask(rf *Raft) {
-	duration := time.Duration(120) * time.Millisecond
+	duration := time.Duration(100) * time.Millisecond
 	for {
 		if isKilled(rf) {
 			fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the heartbeat")
+			// set to killed state
+			atomic.StoreInt32(&rf.state, 3)
 			return
 		}
-		leaerId := int(atomic.LoadInt32(&rf.leaderId))
-		if leaerId == rf.me {
+		if atomic.LoadInt32(&rf.state) == 0 {
 			term := int(atomic.LoadInt32(&rf.term))
 			appendEntryArgs := &AppendEntriesArgs{Term: term, LeaderId: rf.me}
 			appendEntryReply := &AppendEntriesReply{}
@@ -305,6 +291,7 @@ func sendAppendEntiresTask(rf *Raft) {
 				}
 			}
 		} else {
+			// not leader anymore, end the hearbeat
 			break
 		}
 		time.Sleep(duration)
@@ -316,7 +303,7 @@ func isKilled(rf *Raft) bool {
 }
 
 func electionTimeoutTask(rf *Raft) {
-	duration := 500 + rand.Intn(400)
+	duration := 200 + rand.Intn(100)
 	randomDuration := time.Duration(duration) * time.Millisecond
 	for {
 		if isKilled(rf) {
@@ -324,32 +311,28 @@ func electionTimeoutTask(rf *Raft) {
 			return
 		}
 		time.Sleep(randomDuration)
-		electionTimeOutFlag := int(atomic.LoadInt32(&rf.electionTimeOutFlag))
-		leaderId := int(atomic.LoadInt32(&rf.leaderId))
-		if electionTimeOutFlag == 1 {
-			step := int(atomic.LoadInt32(&rf.step))
-			term := int(atomic.LoadInt32(&rf.term))
-			newTerm := term + step
+		state := int(atomic.LoadInt32(&rf.state))
+		if state == 2 {
+			// increase term
+			term := int(atomic.AddInt32(&rf.term, 1))
 			rf.mu.Lock()
-			_, exists := rf.votedFor[newTerm]
+			_, exists := rf.votedFor[term]
 			if !exists {
-				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(newTerm))
-				requestVoteArgs := &RequestVoteArgs{Term: newTerm, CandidateId: rf.me}
-				rf.votedFor[newTerm] = rf.me
+				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(term))
+				rf.votedFor[term] = rf.me
 				rf.mu.Unlock()
-
-				// send vote request to each peer
 				numberOfPeers := len(rf.peers) - 1
 				numberOfVoteGranted := 0
 				var mu sync.Mutex // to safely update numberOfVoteGranted
 				var wg sync.WaitGroup
+				requestVoteArgs := &RequestVoteArgs{Term: term, CandidateId: rf.me}
 				for i := 0; i < len(rf.peers); i++ {
 					if i != rf.me {
 						wg.Add(1)
 						go func(peerId int) {
 							defer wg.Done()
 							requestVoteReply := &RequestVoteReply{}
-							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
+							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(term))
 							succeed := rf.sendRequestVote(peerId, requestVoteArgs, requestVoteReply)
 							if !succeed {
 								fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
@@ -366,24 +349,16 @@ func electionTimeoutTask(rf *Raft) {
 				}
 				wg.Wait()
 				fmt.Println("Id: " + strconv.Itoa(rf.me) + " receive " + strconv.Itoa(numberOfVoteGranted) + " votes out of : " + strconv.Itoa(numberOfPeers))
-
-				term := int(atomic.LoadInt32(&rf.term))
-				if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfPeers/2 && term == newTerm-step {
-					// make itself as leader
-					atomic.StoreInt32(&rf.term, int32(newTerm))
-					atomic.StoreInt32(&rf.electionTimeOutFlag, 0)
-					atomic.StoreInt32(&rf.leaderId, int32(rf.me))
-					fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(newTerm))
+				if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfPeers/2 {
+					// set the state as leader
+					atomic.StoreInt32(&rf.state, 0)
+					fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(term))
 					go sendAppendEntiresTask(rf)
-				} else {
-					// increase the step and wait for next round of leader election
-					atomic.AddInt32(&rf.step, 1)
 				}
-			} else {
-				rf.mu.Unlock()
 			}
-		} else if leaderId != rf.me {
-			atomic.StoreInt32(&rf.electionTimeOutFlag, 1)
+		} else if state == 1 {
+			// update from Follower state to Candidate state
+			atomic.StoreInt32(&rf.state, 2)
 		}
 	}
 }
@@ -404,13 +379,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	atomic.StoreInt32(&rf.electionTimeOutFlag, 1)
 	fmt.Println("Create raft with id: " + strconv.Itoa(me))
 	atomic.StoreInt32(&rf.term, 0)
-	atomic.StoreInt32(&rf.leaderId, -1)
-	rf.votedFor = make(map[int]int)
-	atomic.StoreInt32(&rf.step, 1)
+	atomic.StoreInt32(&rf.state, 2)
 	atomic.StoreInt32(&rf.dead, 0)
+	rf.votedFor = make(map[int]int)
 
 	// Your initialization code here (2A, 2B, 2C).
 	// background process to for leader election
