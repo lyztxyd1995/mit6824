@@ -321,39 +321,51 @@ func electionTimeoutTask(rf *Raft) {
 				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(term))
 				rf.votedFor[term] = rf.me
 				rf.mu.Unlock()
-				numberOfPeers := len(rf.peers) - 1
+				numberOfAlivePeers := len(rf.peers) - 1
 				numberOfVoteGranted := 0
-				var mu sync.Mutex // to safely update numberOfVoteGranted
-				var wg sync.WaitGroup
 				requestVoteArgs := &RequestVoteArgs{Term: term, CandidateId: rf.me}
+
+				voteChannel := make(chan int)
 				for i := 0; i < len(rf.peers); i++ {
 					if i != rf.me {
-						wg.Add(1)
 						go func(peerId int) {
-							defer wg.Done()
 							requestVoteReply := &RequestVoteReply{}
 							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(term))
 							succeed := rf.sendRequestVote(peerId, requestVoteArgs, requestVoteReply)
 							if !succeed {
 								fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
-								mu.Lock()
-								numberOfPeers--
-								mu.Unlock()
+								voteChannel <- 2
 							} else if requestVoteReply.VoteGranted {
-								mu.Lock()
-								numberOfVoteGranted++
-								mu.Unlock()
+								voteChannel <- 0
+							} else {
+								voteChannel <- 1
 							}
 						}(i)
 					}
 				}
-				wg.Wait()
-				fmt.Println("Id: " + strconv.Itoa(rf.me) + " receive " + strconv.Itoa(numberOfVoteGranted) + " votes out of : " + strconv.Itoa(numberOfPeers))
-				if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfPeers/2 {
-					// set the state as leader
-					atomic.StoreInt32(&rf.state, 0)
-					fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(term))
-					go sendAppendEntiresTask(rf)
+
+				sleepDuration := time.Duration(20) * time.Millisecond
+			InnerLoop:
+				for iters := 0; iters < 10; iters++ {
+					select {
+					case voteResult := <-voteChannel:
+						if voteResult == 0 {
+							numberOfVoteGranted++
+							if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfAlivePeers/2 {
+								atomic.StoreInt32(&rf.state, 0)
+								fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(term))
+								go sendAppendEntiresTask(rf)
+								break InnerLoop
+							}
+						} else if voteResult == 1 {
+							// vote is denied
+							fmt.Println("Id: " + strconv.Itoa(rf.me) + " received a deny vote for term " + strconv.Itoa(term))
+						} else {
+							numberOfAlivePeers--
+						}
+					default:
+						time.Sleep(sleepDuration)
+					}
 				}
 			}
 		} else if state == 1 {
