@@ -46,6 +46,11 @@ type ApplyMsg struct {
 
 // Raft is a Go object implementing a single Raft peer.
 
+type Log struct {
+	Command interface{}
+	Term    int
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -54,10 +59,18 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
-	term     int32
-	votedFor map[int]int
-	state    int32 // 0: Leader 1: follower 2: Candidate
-
+	// 2A
+	term       int32
+	termToVote int32
+	votedFor   map[int]int
+	state      int32 // 0: Leader 1: follower 2: Candidate
+	// 2B
+	logMu       sync.Mutex
+	logs        []Log
+	commitedIdx int32
+	appliedIdx  int32
+	nextIndex   []int
+	applyCh     chan ApplyMsg
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 }
@@ -114,8 +127,10 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply is an example RequestVote RPC reply structure.
@@ -146,14 +161,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.logMu.Lock()
+	lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+	rf.logMu.Unlock()
+	var lastLogTerm int
+	if lastLogIndex == -1 {
+		lastLogTerm = 0
+	} else {
+		lastLogTerm = rf.logs[lastLogIndex].Term
+	}
+	if lastLogIndex > args.LastLogIndex || lastLogTerm > args.Term {
+		fmt.Println("Id: " + strconv.Itoa(rf.me) + " with lastLogIndex " + strconv.Itoa(lastLogIndex) +
+			" and last log term: " + strconv.Itoa(lastLogIndex) + " is more up-to-date than candidate")
+		reply.VoteGranted = false
+		reply.Term = term
+		return
+	}
+
 	rf.mu.Lock()
 	votedForId, exists := rf.votedFor[args.Term]
-	rf.mu.Unlock()
 	if !exists || votedForId == args.CandidateId {
 		reply.VoteGranted = true
 		reply.Term = args.Term
+		rf.votedFor[args.Term] = args.CandidateId
+		rf.mu.Unlock()
 		fmt.Println("Id: " + strconv.Itoa(rf.me) + " grant the vote")
 	} else {
+		rf.mu.Unlock()
 		reply.VoteGranted = false
 		reply.Term = args.Term
 		fmt.Println("Id: " + strconv.Itoa(rf.me) + " deny the vote with voted for " + strconv.Itoa(int(votedForId)))
@@ -163,6 +197,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -178,12 +217,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	term := int(atomic.LoadInt32(&rf.term))
 	if term < args.Term {
 		atomic.StoreInt32(&rf.term, int32(args.Term))
+		atomic.StoreInt32(&rf.termToVote, int32(args.Term))
 		atomic.StoreInt32(&rf.state, 1)
 		fmt.Println(strconv.Itoa(rf.me) + " update term to: " + strconv.Itoa(args.Term))
+		reply.Success = false
+		reply.Term = args.Term
 	} else if term == args.Term {
+		commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
 		atomic.StoreInt32(&rf.state, 1)
+		if len(args.Entries) == 0 {
+			// heartbeat message, check for commit message
+			for index := commitIndex + 1; index <= args.LeaderCommit; index++ {
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[index].Command,
+					CommandIndex: index + 1,
+				}
+				rf.applyCh <- applyMsg
+				fmt.Println("id: " + strconv.Itoa(rf.me) + " send message for commit log on index: " + strconv.Itoa(index+1))
+			}
+			atomic.StoreInt32(&rf.commitedIdx, int32(args.LeaderCommit))
+			return
+		}
+		rf.logMu.Lock()
+		defer rf.logMu.Unlock()
+
+		if len(rf.logs) <= args.PrevLogIndex {
+			reply.Success = false
+			reply.Term = args.Term
+			return
+		}
+
+		fmt.Println("id: " + strconv.Itoa(rf.me) + " agree to commit log on index: " + strconv.Itoa(args.PrevLogIndex+1))
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		reply.Success = true
+		reply.Term = args.Term
 	} else {
 		fmt.Println(strconv.Itoa(rf.me) + " receive heartbeat from legacy leader with term: " + strconv.Itoa(args.Term))
+		reply.Success = false
+		reply.Term = term
 	}
 }
 
@@ -219,11 +291,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
 // Start func.
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -239,13 +306,22 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.logMu.Lock()
+	index := len(rf.logs)
+	term := int(atomic.LoadInt32(&rf.term))
+	state := atomic.LoadInt32(&rf.state)
+	isLeader := state == 0
 
-	return index, term, isLeader
+	if isLeader {
+		rf.logs = append(rf.logs, Log{command, term})
+		rf.logMu.Unlock()
+		fmt.Println("id: " + strconv.Itoa(rf.me) + " finish appending log for index " + strconv.Itoa(index))
+		return index + 1, term, true
+	} else {
+		rf.logMu.Unlock()
+		return -1, -1, false
+	}
 }
 
 // Kill func.
@@ -269,35 +345,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func sendAppendEntiresTask(rf *Raft) {
-	duration := time.Duration(100) * time.Millisecond
-	for {
-		if isKilled(rf) {
-			fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the heartbeat")
-			// set to killed state
-			atomic.StoreInt32(&rf.state, 3)
-			return
-		}
-		if atomic.LoadInt32(&rf.state) == 0 {
-			term := int(atomic.LoadInt32(&rf.term))
-			appendEntryArgs := &AppendEntriesArgs{Term: term, LeaderId: rf.me}
-			appendEntryReply := &AppendEntriesReply{}
-			for i := 0; i < len(rf.peers); i++ {
-				if i != rf.me {
-					go func(peerId int) {
-						// fmt.Println("Id: " + rf.id + " send append entry request to " + strconv.Itoa(peerId))
-						rf.sendAppendEntries(peerId, appendEntryArgs, appendEntryReply)
-					}(i)
-				}
-			}
-		} else {
-			// not leader anymore, end the hearbeat
-			break
-		}
-		time.Sleep(duration)
-	}
-}
-
 func isKilled(rf *Raft) bool {
 	return atomic.LoadInt32(&rf.dead) == 1
 }
@@ -313,24 +360,41 @@ func electionTimeoutTask(rf *Raft) {
 		time.Sleep(randomDuration)
 		state := int(atomic.LoadInt32(&rf.state))
 		if state == 2 {
-			// increase term
-			term := int(atomic.AddInt32(&rf.term, 1))
+			// increase term to vote
+			termToVote := int(atomic.AddInt32(&rf.termToVote, 1))
+			rf.logMu.Lock()
+			lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+			rf.logMu.Unlock()
+			var lastLogTerm int
+			if lastLogIndex == -1 {
+				lastLogTerm = 0
+			} else {
+				lastLogTerm = rf.logs[lastLogIndex].Term
+			}
 			rf.mu.Lock()
-			_, exists := rf.votedFor[term]
+			_, exists := rf.votedFor[termToVote]
 			if !exists {
-				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(term))
-				rf.votedFor[term] = rf.me
+				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(termToVote))
+				rf.votedFor[termToVote] = rf.me
 				rf.mu.Unlock()
 				numberOfAlivePeers := len(rf.peers) - 1
 				numberOfVoteGranted := 0
-				requestVoteArgs := &RequestVoteArgs{Term: term, CandidateId: rf.me}
+				numberOfVoteDenied := 0
+
+				requestVoteArgs := &RequestVoteArgs{
+					Term:         termToVote,
+					CandidateId:  rf.me,
+					LastLogIndex: lastLogIndex,
+					LastLogTerm:  lastLogTerm,
+				}
 
 				voteChannel := make(chan int)
+
 				for i := 0; i < len(rf.peers); i++ {
 					if i != rf.me {
 						go func(peerId int) {
 							requestVoteReply := &RequestVoteReply{}
-							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(term))
+							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(termToVote))
 							succeed := rf.sendRequestVote(peerId, requestVoteArgs, requestVoteReply)
 							if !succeed {
 								fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
@@ -353,13 +417,23 @@ func electionTimeoutTask(rf *Raft) {
 							numberOfVoteGranted++
 							if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfAlivePeers/2 {
 								atomic.StoreInt32(&rf.state, 0)
-								fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(term))
-								go sendAppendEntiresTask(rf)
+								fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(termToVote))
+								// update term to termToVote
+								atomic.StoreInt32(&rf.term, int32(termToVote))
+								commitedIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+								for i := 0; i < len(rf.nextIndex); i++ {
+									rf.nextIndex[i] = commitedIndex + 1
+								}
+								go commitLogTask(rf)
 								break InnerLoop
 							}
 						} else if voteResult == 1 {
 							// vote is denied
-							fmt.Println("Id: " + strconv.Itoa(rf.me) + " received a deny vote for term " + strconv.Itoa(term))
+							fmt.Println("Id: " + strconv.Itoa(rf.me) + " received a deny vote for term " + strconv.Itoa(termToVote))
+							numberOfVoteDenied++
+							if numberOfVoteDenied > numberOfAlivePeers/2 {
+								break InnerLoop
+							}
 						} else {
 							numberOfAlivePeers--
 						}
@@ -367,6 +441,8 @@ func electionTimeoutTask(rf *Raft) {
 						time.Sleep(sleepDuration)
 					}
 				}
+			} else {
+				rf.mu.Unlock()
 			}
 		} else if state == 1 {
 			// update from Follower state to Candidate state
@@ -389,13 +465,19 @@ func electionTimeoutTask(rf *Raft) {
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
+	rf.nextIndex = make([]int, len(peers))
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 	fmt.Println("Create raft with id: " + strconv.Itoa(me))
 	atomic.StoreInt32(&rf.term, 0)
-	atomic.StoreInt32(&rf.state, 2)
+	atomic.StoreInt32(&rf.termToVote, 0)
+	atomic.StoreInt32(&rf.state, 1)
 	atomic.StoreInt32(&rf.dead, 0)
 	rf.votedFor = make(map[int]int)
+
+	atomic.StoreInt32(&rf.commitedIdx, -1)
+	atomic.StoreInt32(&rf.appliedIdx, -1)
 
 	// Your initialization code here (2A, 2B, 2C).
 	// background process to for leader election
