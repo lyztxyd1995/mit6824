@@ -13,7 +13,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func commitLogTask(rf *Raft) {
-	sleepDuration := time.Duration(100) * time.Millisecond
+	sleepDuration := time.Duration(150) * time.Millisecond
 	for {
 		if isKilled(rf) {
 			fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the commit log task")
@@ -38,13 +38,21 @@ func (rf *Raft) commitLog() {
 	rf.logMu.Unlock()
 	commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
 	currentTerm := int(atomic.LoadInt32(&rf.term))
+
+	// TODO, merge heartbeat with regular log commit
+	// in case there's a legacy log difference in commit index, the heartbeat won't be able to detect
+	// this will resolve the failure in test case TestBackup2B
 	if commitIndex == logLength-1 {
 		// logs are all commited, just send heartbeat message
+		prevLogTerm := 0
+		if commitIndex >= 0 {
+			prevLogTerm = rf.logs[commitIndex].Term
+		}
 		appendEntryArgs := &AppendEntriesArgs{
 			Term:         currentTerm,
 			LeaderId:     rf.me,
-			PrevLogIndex: -1,
-			PrevLogTerm:  -1,
+			PrevLogIndex: commitIndex,
+			PrevLogTerm:  prevLogTerm,
 			Entries:      make([]Log, 0),
 			LeaderCommit: commitIndex,
 		}
@@ -98,9 +106,11 @@ func (rf *Raft) commitLog() {
 								commitChannel <- false
 							} else {
 								// decrements the prev index and re-send request
-								appendEntryArgs.PrevLogIndex--
-								rf.nextIndex[peerId] = appendEntryArgs.PrevLogIndex + 1
 								if appendEntryArgs.PrevLogIndex >= 0 {
+									appendEntryArgs.PrevLogIndex--
+								}
+								rf.nextIndex[peerId] = appendEntryArgs.PrevLogIndex + 1
+								if appendEntryArgs.PrevLogIndex > 0 {
 									appendEntryArgs.Entries = rf.logs[appendEntryArgs.PrevLogIndex : nextCommitIndex+1]
 								} else {
 									appendEntryArgs.Entries = rf.logs[:nextCommitIndex+1]

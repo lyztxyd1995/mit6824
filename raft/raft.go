@@ -226,6 +226,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
 		atomic.StoreInt32(&rf.state, 1)
 		if len(args.Entries) == 0 {
+			if args.LeaderCommit == -1 {
+				// fmt.Println("id: " + strconv.Itoa(rf.me) + " heartbeat, no log to commit, just return")
+				return
+			}
+			// edge case: may contain legacy uncommited log
+			if len(rf.logs) <= args.LeaderCommit {
+				// fmt.Println("id: " + strconv.Itoa(rf.me) + " heartbeat, log entry haven't got appended, just return")
+				return
+			}
+			if rf.logs[args.LeaderCommit].Term != args.PrevLogTerm {
+				// fmt.Println("id: " + strconv.Itoa(rf.me) + " log in index: " + strconv.Itoa(args.LeaderCommit) + " is outdated, skip heartbeat")
+				return
+			}
 			// heartbeat message, check for commit message
 			for index := commitIndex + 1; index <= args.LeaderCommit; index++ {
 				applyMsg := ApplyMsg{
@@ -243,13 +256,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		defer rf.logMu.Unlock()
 
 		if len(rf.logs) <= args.PrevLogIndex {
+			// fmt.Println("id: " + strconv.Itoa(rf.me) + " does't have log appended, need to re-append prev log")
 			reply.Success = false
 			reply.Term = args.Term
 			return
 		}
 
-		fmt.Println("id: " + strconv.Itoa(rf.me) + " agree to commit log on index: " + strconv.Itoa(args.PrevLogIndex+1))
+		if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+			// fmt.Println("id: " + strconv.Itoa(rf.me) + " term in prev log is outdated, need to be updated")
+			reply.Success = false
+			reply.Term = args.Term
+			return
+		}
+
 		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		fmt.Println("id: " + strconv.Itoa(rf.me) + " agree to commit log on index: " + strconv.Itoa(args.PrevLogIndex+1))
+		fmt.Println(rf.logs)
 		reply.Success = true
 		reply.Term = args.Term
 	} else {
@@ -316,7 +338,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.logs = append(rf.logs, Log{command, term})
 		rf.logMu.Unlock()
-		fmt.Println("id: " + strconv.Itoa(rf.me) + " finish appending log for index " + strconv.Itoa(index))
 		return index + 1, term, true
 	} else {
 		rf.logMu.Unlock()
@@ -350,7 +371,7 @@ func isKilled(rf *Raft) bool {
 }
 
 func electionTimeoutTask(rf *Raft) {
-	duration := 200 + rand.Intn(100)
+	duration := 300 + rand.Intn(300)
 	randomDuration := time.Duration(duration) * time.Millisecond
 	for {
 		if isKilled(rf) {
