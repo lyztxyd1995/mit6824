@@ -90,17 +90,12 @@ func (rf *Raft) commitLog() {
 				appendEntryReply := &AppendEntriesReply{}
 				succeed := false
 				for !succeed {
-					fmt.Println("id: " + strconv.Itoa(rf.me) + " send log to " + strconv.Itoa(peerId) + " with PrevLogIndex: " + strconv.Itoa(appendEntryArgs.PrevLogIndex))
-					fmt.Println(appendEntryArgs.Entries)
-
 					succeed = rf.sendAppendEntries(peerId, appendEntryArgs, appendEntryReply)
 					if succeed {
 						if appendEntryReply.Success {
 							rf.nextIndex[peerId] = nextCommitIndex + 1
-							fmt.Println("next index for id " + strconv.Itoa(peerId) + " is updated to " + strconv.Itoa(nextCommitIndex+1))
 							commitChannel <- appendEntryReply.Success
 						} else {
-							fmt.Println("id: " + strconv.Itoa(rf.me) + " commit not success")
 							if appendEntryReply.Term > currentTerm {
 								// the follower's current term is greater than the leader's term, return false
 								commitChannel <- false
@@ -137,7 +132,6 @@ func (rf *Raft) commitLog() {
 					// commit the new log
 					atomic.StoreInt32(&rf.commitedIdx, int32(nextCommitIndex))
 					fmt.Println("log index " + strconv.Itoa(nextCommitIndex) + " is commited")
-					fmt.Println(rf.logs)
 					applyMsg := ApplyMsg{
 						CommandValid: true,
 						Command:      rf.logs[nextCommitIndex].Command,

@@ -150,8 +150,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the vote")
 		return
 	}
-	fmt.Println("Id: " + strconv.Itoa(rf.me) + " receive vote request")
-	fmt.Println(args)
+	// fmt.Println("Id: " + strconv.Itoa(rf.me) + " receive vote request")
+	// fmt.Println(args)
 
 	term := int(atomic.LoadInt32(&rf.term))
 	// Reject vote if term is less or equal with the current term
@@ -170,7 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
-	if lastLogIndex > args.LastLogIndex || lastLogTerm > args.Term {
+	if lastLogIndex > args.LastLogIndex || lastLogTerm > args.LastLogTerm {
 		fmt.Println("Id: " + strconv.Itoa(rf.me) + " with lastLogIndex " + strconv.Itoa(lastLogIndex) +
 			" and last log term: " + strconv.Itoa(lastLogIndex) + " is more up-to-date than candidate")
 		reply.VoteGranted = false
@@ -270,8 +270,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-		fmt.Println("id: " + strconv.Itoa(rf.me) + " agree to commit log on index: " + strconv.Itoa(args.PrevLogIndex+1))
-		fmt.Println(rf.logs)
 		reply.Success = true
 		reply.Term = args.Term
 	} else {
@@ -396,7 +394,6 @@ func electionTimeoutTask(rf *Raft) {
 			_, exists := rf.votedFor[termToVote]
 			if !exists {
 				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(termToVote))
-				rf.votedFor[termToVote] = rf.me
 				rf.mu.Unlock()
 				numberOfAlivePeers := len(rf.peers) - 1
 				numberOfVoteGranted := 0
@@ -415,7 +412,7 @@ func electionTimeoutTask(rf *Raft) {
 					if i != rf.me {
 						go func(peerId int) {
 							requestVoteReply := &RequestVoteReply{}
-							fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(termToVote))
+							// fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(termToVote))
 							succeed := rf.sendRequestVote(peerId, requestVoteArgs, requestVoteReply)
 							if !succeed {
 								fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
@@ -441,6 +438,7 @@ func electionTimeoutTask(rf *Raft) {
 								fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(termToVote))
 								// update term to termToVote
 								atomic.StoreInt32(&rf.term, int32(termToVote))
+								rf.votedFor[termToVote] = rf.me
 								commitedIndex := int(atomic.LoadInt32(&rf.commitedIdx))
 								for i := 0; i < len(rf.nextIndex); i++ {
 									rf.nextIndex[i] = commitedIndex + 1
@@ -450,13 +448,10 @@ func electionTimeoutTask(rf *Raft) {
 							}
 						} else if voteResult == 1 {
 							// vote is denied
-							fmt.Println("Id: " + strconv.Itoa(rf.me) + " received a deny vote for term " + strconv.Itoa(termToVote))
 							numberOfVoteDenied++
 							if numberOfVoteDenied > numberOfAlivePeers/2 {
 								break InnerLoop
 							}
-						} else {
-							numberOfAlivePeers--
 						}
 					default:
 						time.Sleep(sleepDuration)
