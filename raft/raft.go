@@ -65,7 +65,6 @@ type Raft struct {
 	votedFor   map[int]int
 	state      int32 // 0: Leader 1: follower 2: Candidate
 	// 2B
-	logMu       sync.Mutex
 	logs        []Log
 	commitedIdx int32
 	appliedIdx  int32
@@ -96,11 +95,12 @@ func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
+	// encoder := labgob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
 }
 
 // restore previously persisted state.
@@ -147,11 +147,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	if isKilled(rf) {
 		reply.VoteGranted = false
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the vote")
+		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the vote")
 		return
 	}
 	// fmt.Println("Id: " + strconv.Itoa(rf.me) + " receive vote request")
 	// fmt.Println(args)
+
+	state := int(atomic.LoadInt32(&rf.state))
+	if state == 1 {
+		// in follower state, reject the vote
+		reply.VoteGranted = false
+		reply.Term = args.Term
+		return
+	}
 
 	term := int(atomic.LoadInt32(&rf.term))
 	// Reject vote if term is less or equal with the current term
@@ -161,9 +169,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.logMu.Lock()
 	lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
-	rf.logMu.Unlock()
 	var lastLogTerm int
 	if lastLogIndex == -1 {
 		lastLogTerm = 0
@@ -171,8 +177,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
 	if lastLogIndex > args.LastLogIndex || lastLogTerm > args.LastLogTerm {
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " with lastLogIndex " + strconv.Itoa(lastLogIndex) +
-			" and last log term: " + strconv.Itoa(lastLogIndex) + " is more up-to-date than candidate")
+		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " with lastLogIndex " + strconv.Itoa(lastLogIndex) +
+		// 	" and last log term: " + strconv.Itoa(lastLogIndex) + " is more up-to-date than candidate")
 		reply.VoteGranted = false
 		reply.Term = term
 		return
@@ -185,12 +191,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = args.Term
 		rf.votedFor[args.Term] = args.CandidateId
 		rf.mu.Unlock()
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " grant the vote")
+		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " grant the vote")
 	} else {
 		rf.mu.Unlock()
 		reply.VoteGranted = false
 		reply.Term = args.Term
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " deny the vote with voted for " + strconv.Itoa(int(votedForId)))
+		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " deny the vote with voted for " + strconv.Itoa(int(votedForId)))
 	}
 }
 
@@ -205,13 +211,14 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	Success      bool
+	UnmatchIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if isKilled(rf) {
-		fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the append entry request")
+		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the append entry request")
 		return
 	}
 	term := int(atomic.LoadInt32(&rf.term))
@@ -219,7 +226,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		atomic.StoreInt32(&rf.term, int32(args.Term))
 		atomic.StoreInt32(&rf.termToVote, int32(args.Term))
 		atomic.StoreInt32(&rf.state, 1)
-		fmt.Println(strconv.Itoa(rf.me) + " update term to: " + strconv.Itoa(args.Term))
+		// fmt.Println(strconv.Itoa(rf.me) + " update term to: " + strconv.Itoa(args.Term))
 		reply.Success = false
 		reply.Term = args.Term
 	} else if term == args.Term {
@@ -247,23 +254,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					CommandIndex: index + 1,
 				}
 				rf.applyCh <- applyMsg
-				fmt.Println("id: " + strconv.Itoa(rf.me) + " send message for commit log on index: " + strconv.Itoa(index+1))
+				// fmt.Println("id: " + strconv.Itoa(rf.me) + " send message for commit log on index: " + strconv.Itoa(index+1))
 			}
 			atomic.StoreInt32(&rf.commitedIdx, int32(args.LeaderCommit))
 			return
 		}
-		rf.logMu.Lock()
-		defer rf.logMu.Unlock()
 
 		if len(rf.logs) <= args.PrevLogIndex {
 			// fmt.Println("id: " + strconv.Itoa(rf.me) + " does't have log appended, need to re-append prev log")
 			reply.Success = false
 			reply.Term = args.Term
+			reply.UnmatchIndex = len(rf.logs) - 1
 			return
 		}
 
 		if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// fmt.Println("id: " + strconv.Itoa(rf.me) + " term in prev log is outdated, need to be updated")
+			for i := 0; i < args.PrevLogIndex; i++ {
+				if rf.logs[i].Term == args.PrevLogTerm {
+					fmt.Println("id: " + strconv.Itoa(rf.me) + " set unmatch index to " + strconv.Itoa(i))
+					reply.UnmatchIndex = i
+					reply.Success = false
+					reply.Term = args.Term
+					return
+				}
+			}
+			reply.UnmatchIndex = -1
 			reply.Success = false
 			reply.Term = args.Term
 			return
@@ -273,7 +289,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		reply.Term = args.Term
 	} else {
-		fmt.Println(strconv.Itoa(rf.me) + " receive heartbeat from legacy leader with term: " + strconv.Itoa(args.Term))
+		// fmt.Println(strconv.Itoa(rf.me) + " receive heartbeat from legacy leader with term: " + strconv.Itoa(args.Term))
 		reply.Success = false
 		reply.Term = term
 	}
@@ -327,7 +343,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	rf.logMu.Lock()
 	index := len(rf.logs)
 	term := int(atomic.LoadInt32(&rf.term))
 	state := atomic.LoadInt32(&rf.state)
@@ -335,10 +350,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if isLeader {
 		rf.logs = append(rf.logs, Log{command, term})
-		rf.logMu.Unlock()
 		return index + 1, term, true
 	} else {
-		rf.logMu.Unlock()
 		return -1, -1, false
 	}
 }
@@ -373,7 +386,7 @@ func electionTimeoutTask(rf *Raft) {
 	randomDuration := time.Duration(duration) * time.Millisecond
 	for {
 		if isKilled(rf) {
-			fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the election check")
+			// fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the election check")
 			return
 		}
 		time.Sleep(randomDuration)
@@ -381,9 +394,7 @@ func electionTimeoutTask(rf *Raft) {
 		if state == 2 {
 			// increase term to vote
 			termToVote := int(atomic.AddInt32(&rf.termToVote, 1))
-			rf.logMu.Lock()
 			lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
-			rf.logMu.Unlock()
 			var lastLogTerm int
 			if lastLogIndex == -1 {
 				lastLogTerm = 0
@@ -393,7 +404,7 @@ func electionTimeoutTask(rf *Raft) {
 			rf.mu.Lock()
 			_, exists := rf.votedFor[termToVote]
 			if !exists {
-				fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(termToVote))
+				// fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(termToVote))
 				rf.mu.Unlock()
 				numberOfAlivePeers := len(rf.peers) - 1
 				numberOfVoteGranted := 0
@@ -415,7 +426,7 @@ func electionTimeoutTask(rf *Raft) {
 							// fmt.Println("Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId) + " with new term: " + strconv.Itoa(termToVote))
 							succeed := rf.sendRequestVote(peerId, requestVoteArgs, requestVoteReply)
 							if !succeed {
-								fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
+								// fmt.Println("vote request failed " + strconv.Itoa(peerId) + ": " + "Id: " + strconv.Itoa(rf.me) + " sends vote request to: " + strconv.Itoa(peerId))
 								voteChannel <- 2
 							} else if requestVoteReply.VoteGranted {
 								voteChannel <- 0
@@ -435,8 +446,7 @@ func electionTimeoutTask(rf *Raft) {
 							numberOfVoteGranted++
 							if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfAlivePeers/2 {
 								atomic.StoreInt32(&rf.state, 0)
-								fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(termToVote))
-								// update term to termToVote
+								// fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(termToVote))
 								atomic.StoreInt32(&rf.term, int32(termToVote))
 								rf.votedFor[termToVote] = rf.me
 								commitedIndex := int(atomic.LoadInt32(&rf.commitedIdx))

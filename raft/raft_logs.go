@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"fmt"
-	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -16,7 +14,6 @@ func commitLogTask(rf *Raft) {
 	sleepDuration := time.Duration(150) * time.Millisecond
 	for {
 		if isKilled(rf) {
-			fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, stop the commit log task")
 			// set to killed state
 			atomic.StoreInt32(&rf.state, 3)
 			return
@@ -25,7 +22,6 @@ func commitLogTask(rf *Raft) {
 			rf.commitLog()
 			time.Sleep(sleepDuration)
 		} else {
-			fmt.Println("Id: " + strconv.Itoa(rf.me) + " is no longer leader, stop the commit log task")
 			return
 		}
 	}
@@ -33,9 +29,7 @@ func commitLogTask(rf *Raft) {
 
 func (rf *Raft) commitLog() {
 	commitChannel := make(chan bool)
-	rf.logMu.Lock()
 	logLength := len(rf.logs)
-	rf.logMu.Unlock()
 	commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
 	currentTerm := int(atomic.LoadInt32(&rf.term))
 
@@ -67,7 +61,6 @@ func (rf *Raft) commitLog() {
 		return
 	}
 	nextCommitIndex := commitIndex + 1
-	fmt.Println("id: " + strconv.Itoa(rf.me) + " start to commit log for index " + strconv.Itoa(nextCommitIndex))
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -101,9 +94,10 @@ func (rf *Raft) commitLog() {
 								commitChannel <- false
 							} else {
 								// decrements the prev index and re-send request
-								if appendEntryArgs.PrevLogIndex >= 0 {
-									appendEntryArgs.PrevLogIndex--
-								}
+								// if appendEntryArgs.PrevLogIndex >= 0 {
+								// 	appendEntryArgs.PrevLogIndex--
+								// }
+								appendEntryArgs.PrevLogIndex = appendEntryReply.UnmatchIndex
 								rf.nextIndex[peerId] = appendEntryArgs.PrevLogIndex + 1
 								if appendEntryArgs.PrevLogIndex > 0 {
 									appendEntryArgs.Entries = rf.logs[appendEntryArgs.PrevLogIndex : nextCommitIndex+1]
@@ -131,7 +125,6 @@ func (rf *Raft) commitLog() {
 				if numOfAccept >= numOfPeers/2 {
 					// commit the new log
 					atomic.StoreInt32(&rf.commitedIdx, int32(nextCommitIndex))
-					fmt.Println("log index " + strconv.Itoa(nextCommitIndex) + " is commited")
 					applyMsg := ApplyMsg{
 						CommandValid: true,
 						Command:      rf.logs[nextCommitIndex].Command,
