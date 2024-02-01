@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -59,19 +61,26 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
-	// 2A
-	term       int32
+	// Encoded fields
+	Term        int32
+	CommitedIdx int32
+	VotedFor    map[int]int
+	Logs        []Log
+
 	termToVote int32
-	votedFor   map[int]int
 	state      int32 // 0: Leader 1: follower 2: Candidate
 	// 2B
-	logs        []Log
-	commitedIdx int32
-	appliedIdx  int32
-	nextIndex   []int
-	applyCh     chan ApplyMsg
+	nextIndex []int
+	applyCh   chan ApplyMsg
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+}
+
+type PersistnceStates struct {
+	Term        int32
+	CommitedIdx int32
+	VotedFor    map[int]int
+	Logs        []Log
 }
 
 // GetState returns currentTerm and whether this server
@@ -81,7 +90,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	term = int(atomic.LoadInt32(&rf.term))
+	term = int(atomic.LoadInt32(&rf.Term))
 	state := atomic.LoadInt32(&rf.state)
 	isleader = state == 0
 
@@ -94,8 +103,17 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// encoder := labgob.NewEncoder(w)
+	w := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(w)
+	persistenceState := &PersistnceStates{
+		Term:        rf.Term,
+		CommitedIdx: rf.CommitedIdx,
+		VotedFor:    rf.VotedFor,
+		Logs:        rf.Logs,
+	}
+	encoder.Encode(persistenceState)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
@@ -110,10 +128,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
+	var persistenceState PersistnceStates
+	r := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(r)
+	err := decoder.Decode(&persistenceState)
+	if err != nil {
+		fmt.Println("In readPersist, error: ", err)
+		return
+	}
+	rf.Logs = persistenceState.Logs
+	rf.VotedFor = persistenceState.VotedFor
+	atomic.StoreInt32(&rf.Term, persistenceState.Term)
+	atomic.StoreInt32(&rf.CommitedIdx, persistenceState.CommitedIdx)
 	// var xxx
 	// var yyy
+
 	// if d.Decode(&xxx) != nil ||
 	//    d.Decode(&yyy) != nil {
 	//   error...
@@ -161,7 +190,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	term := int(atomic.LoadInt32(&rf.term))
+	term := int(atomic.LoadInt32(&rf.Term))
 	// Reject vote if term is less or equal with the current term
 	if term > args.Term {
 		reply.VoteGranted = false
@@ -169,12 +198,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+	lastLogIndex := int(atomic.LoadInt32(&rf.CommitedIdx))
 	var lastLogTerm int
 	if lastLogIndex == -1 {
 		lastLogTerm = 0
 	} else {
-		lastLogTerm = rf.logs[lastLogIndex].Term
+		lastLogTerm = rf.Logs[lastLogIndex].Term
 	}
 	if lastLogIndex > args.LastLogIndex || lastLogTerm > args.LastLogTerm {
 		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " with lastLogIndex " + strconv.Itoa(lastLogIndex) +
@@ -185,11 +214,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.mu.Lock()
-	votedForId, exists := rf.votedFor[args.Term]
+	votedForId, exists := rf.VotedFor[args.Term]
 	if !exists || votedForId == args.CandidateId {
 		reply.VoteGranted = true
 		reply.Term = args.Term
-		rf.votedFor[args.Term] = args.CandidateId
+		rf.VotedFor[args.Term] = args.CandidateId
+		rf.persist()
 		rf.mu.Unlock()
 		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " grant the vote")
 	} else {
@@ -221,16 +251,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// fmt.Println("Id: " + strconv.Itoa(rf.me) + " has been kiiled, deny the append entry request")
 		return
 	}
-	term := int(atomic.LoadInt32(&rf.term))
+	term := int(atomic.LoadInt32(&rf.Term))
 	if term < args.Term {
-		atomic.StoreInt32(&rf.term, int32(args.Term))
+		atomic.StoreInt32(&rf.Term, int32(args.Term))
 		atomic.StoreInt32(&rf.termToVote, int32(args.Term))
 		atomic.StoreInt32(&rf.state, 1)
 		// fmt.Println(strconv.Itoa(rf.me) + " update term to: " + strconv.Itoa(args.Term))
+		rf.persist()
 		reply.Success = false
 		reply.Term = args.Term
 	} else if term == args.Term {
-		commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+		commitIndex := int(atomic.LoadInt32(&rf.CommitedIdx))
 		atomic.StoreInt32(&rf.state, 1)
 		if len(args.Entries) == 0 {
 			if args.LeaderCommit == -1 {
@@ -238,11 +269,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				return
 			}
 			// edge case: may contain legacy uncommited log
-			if len(rf.logs) <= args.LeaderCommit {
+			if len(rf.Logs) <= args.LeaderCommit {
 				// fmt.Println("id: " + strconv.Itoa(rf.me) + " heartbeat, log entry haven't got appended, just return")
 				return
 			}
-			if rf.logs[args.LeaderCommit].Term != args.PrevLogTerm {
+			if rf.Logs[args.LeaderCommit].Term != args.PrevLogTerm {
 				// fmt.Println("id: " + strconv.Itoa(rf.me) + " log in index: " + strconv.Itoa(args.LeaderCommit) + " is outdated, skip heartbeat")
 				return
 			}
@@ -250,28 +281,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			for index := commitIndex + 1; index <= args.LeaderCommit; index++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.logs[index].Command,
+					Command:      rf.Logs[index].Command,
 					CommandIndex: index + 1,
 				}
 				rf.applyCh <- applyMsg
 				// fmt.Println("id: " + strconv.Itoa(rf.me) + " send message for commit log on index: " + strconv.Itoa(index+1))
 			}
-			atomic.StoreInt32(&rf.commitedIdx, int32(args.LeaderCommit))
+			atomic.StoreInt32(&rf.CommitedIdx, int32(args.LeaderCommit))
+			rf.persist()
 			return
 		}
 
-		if len(rf.logs) <= args.PrevLogIndex {
+		if len(rf.Logs) <= args.PrevLogIndex {
 			// fmt.Println("id: " + strconv.Itoa(rf.me) + " does't have log appended, need to re-append prev log")
 			reply.Success = false
 			reply.Term = args.Term
-			reply.UnmatchIndex = len(rf.logs) - 1
+			reply.UnmatchIndex = len(rf.Logs) - 1
 			return
 		}
 
-		if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		if args.PrevLogIndex >= 0 && rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// fmt.Println("id: " + strconv.Itoa(rf.me) + " term in prev log is outdated, need to be updated")
 			for i := 0; i < args.PrevLogIndex; i++ {
-				if rf.logs[i].Term == args.PrevLogTerm {
+				if rf.Logs[i].Term == args.PrevLogTerm {
 					fmt.Println("id: " + strconv.Itoa(rf.me) + " set unmatch index to " + strconv.Itoa(i))
 					reply.UnmatchIndex = i
 					reply.Success = false
@@ -285,7 +317,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		rf.Logs = append(rf.Logs[:args.PrevLogIndex+1], args.Entries...)
+		rf.persist()
 		reply.Success = true
 		reply.Term = args.Term
 	} else {
@@ -343,13 +376,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	index := len(rf.logs)
-	term := int(atomic.LoadInt32(&rf.term))
+	index := len(rf.Logs)
+	term := int(atomic.LoadInt32(&rf.Term))
 	state := atomic.LoadInt32(&rf.state)
 	isLeader := state == 0
 
 	if isLeader {
-		rf.logs = append(rf.logs, Log{command, term})
+		rf.Logs = append(rf.Logs, Log{command, term})
 		return index + 1, term, true
 	} else {
 		return -1, -1, false
@@ -394,15 +427,15 @@ func electionTimeoutTask(rf *Raft) {
 		if state == 2 {
 			// increase term to vote
 			termToVote := int(atomic.AddInt32(&rf.termToVote, 1))
-			lastLogIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+			lastLogIndex := int(atomic.LoadInt32(&rf.CommitedIdx))
 			var lastLogTerm int
 			if lastLogIndex == -1 {
 				lastLogTerm = 0
 			} else {
-				lastLogTerm = rf.logs[lastLogIndex].Term
+				lastLogTerm = rf.Logs[lastLogIndex].Term
 			}
 			rf.mu.Lock()
-			_, exists := rf.votedFor[termToVote]
+			_, exists := rf.VotedFor[termToVote]
 			if !exists {
 				// fmt.Println("Id: " + strconv.Itoa(rf.me) + " trys to select for leader with term: " + strconv.Itoa(termToVote))
 				rf.mu.Unlock()
@@ -447,9 +480,9 @@ func electionTimeoutTask(rf *Raft) {
 							if numberOfVoteGranted > 0 && numberOfVoteGranted >= numberOfAlivePeers/2 {
 								atomic.StoreInt32(&rf.state, 0)
 								// fmt.Println("Id: " + strconv.Itoa(rf.me) + " becomes the leader for term " + strconv.Itoa(termToVote))
-								atomic.StoreInt32(&rf.term, int32(termToVote))
-								rf.votedFor[termToVote] = rf.me
-								commitedIndex := int(atomic.LoadInt32(&rf.commitedIdx))
+								atomic.StoreInt32(&rf.Term, int32(termToVote))
+								rf.VotedFor[termToVote] = rf.me
+								commitedIndex := int(atomic.LoadInt32(&rf.CommitedIdx))
 								for i := 0; i < len(rf.nextIndex); i++ {
 									rf.nextIndex[i] = commitedIndex + 1
 								}
@@ -496,21 +529,20 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 	rf.applyCh = applyCh
 	fmt.Println("Create raft with id: " + strconv.Itoa(me))
-	atomic.StoreInt32(&rf.term, 0)
+	atomic.StoreInt32(&rf.Term, 0)
 	atomic.StoreInt32(&rf.termToVote, 0)
 	atomic.StoreInt32(&rf.state, 1)
 	atomic.StoreInt32(&rf.dead, 0)
-	rf.votedFor = make(map[int]int)
+	rf.VotedFor = make(map[int]int)
 
-	atomic.StoreInt32(&rf.commitedIdx, -1)
-	atomic.StoreInt32(&rf.appliedIdx, -1)
+	atomic.StoreInt32(&rf.CommitedIdx, -1)
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	// Your initialization code here (2A, 2B, 2C).
 	// background process to for leader election
 	go electionTimeoutTask(rf)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }

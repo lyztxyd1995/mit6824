@@ -29,9 +29,9 @@ func commitLogTask(rf *Raft) {
 
 func (rf *Raft) commitLog() {
 	commitChannel := make(chan bool)
-	logLength := len(rf.logs)
-	commitIndex := int(atomic.LoadInt32(&rf.commitedIdx))
-	currentTerm := int(atomic.LoadInt32(&rf.term))
+	logLength := len(rf.Logs)
+	commitIndex := int(atomic.LoadInt32(&rf.CommitedIdx))
+	currentTerm := int(atomic.LoadInt32(&rf.Term))
 
 	// TODO, merge heartbeat with regular log commit
 	// in case there's a legacy log difference in commit index, the heartbeat won't be able to detect
@@ -40,7 +40,7 @@ func (rf *Raft) commitLog() {
 		// logs are all commited, just send heartbeat message
 		prevLogTerm := 0
 		if commitIndex >= 0 {
-			prevLogTerm = rf.logs[commitIndex].Term
+			prevLogTerm = rf.Logs[commitIndex].Term
 		}
 		appendEntryArgs := &AppendEntriesArgs{
 			Term:         currentTerm,
@@ -70,15 +70,15 @@ func (rf *Raft) commitLog() {
 				if prevLogIndex == -1 {
 					prevLogTerm = 0
 				} else {
-					prevLogTerm = rf.logs[prevLogIndex].Term
+					prevLogTerm = rf.Logs[prevLogIndex].Term
 				}
 				appendEntryArgs := &AppendEntriesArgs{
 					Term:         currentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
-					Entries:      rf.logs[prevLogIndex+1 : nextCommitIndex+1],
-					LeaderCommit: int(rf.commitedIdx),
+					Entries:      rf.Logs[prevLogIndex+1 : nextCommitIndex+1],
+					LeaderCommit: int(rf.CommitedIdx),
 				}
 				appendEntryReply := &AppendEntriesReply{}
 				succeed := false
@@ -93,16 +93,12 @@ func (rf *Raft) commitLog() {
 								// the follower's current term is greater than the leader's term, return false
 								commitChannel <- false
 							} else {
-								// decrements the prev index and re-send request
-								// if appendEntryArgs.PrevLogIndex >= 0 {
-								// 	appendEntryArgs.PrevLogIndex--
-								// }
 								appendEntryArgs.PrevLogIndex = appendEntryReply.UnmatchIndex
 								rf.nextIndex[peerId] = appendEntryArgs.PrevLogIndex + 1
 								if appendEntryArgs.PrevLogIndex > 0 {
-									appendEntryArgs.Entries = rf.logs[appendEntryArgs.PrevLogIndex : nextCommitIndex+1]
+									appendEntryArgs.Entries = rf.Logs[appendEntryArgs.PrevLogIndex : nextCommitIndex+1]
 								} else {
-									appendEntryArgs.Entries = rf.logs[:nextCommitIndex+1]
+									appendEntryArgs.Entries = rf.Logs[:nextCommitIndex+1]
 								}
 								succeed = false
 							}
@@ -124,13 +120,14 @@ func (rf *Raft) commitLog() {
 				numOfAccept++
 				if numOfAccept >= numOfPeers/2 {
 					// commit the new log
-					atomic.StoreInt32(&rf.commitedIdx, int32(nextCommitIndex))
+					atomic.StoreInt32(&rf.CommitedIdx, int32(nextCommitIndex))
 					applyMsg := ApplyMsg{
 						CommandValid: true,
-						Command:      rf.logs[nextCommitIndex].Command,
+						Command:      rf.Logs[nextCommitIndex].Command,
 						CommandIndex: nextCommitIndex + 1,
 					}
 					rf.applyCh <- applyMsg
+					rf.persist()
 					return
 				}
 			}
